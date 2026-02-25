@@ -1,4 +1,4 @@
-#!/Users/marcelomendes/Documents/GitHub/azure-nps/web/.venv/bin/python3
+#!/Users/marcelomendes/Documents/GitHub/web/.venv/bin/python3.12
 import sys
 from jsonschema.cli import main
 if __name__ == '__main__':

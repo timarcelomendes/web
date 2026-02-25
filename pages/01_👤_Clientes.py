@@ -1,50 +1,21 @@
-import os, re, hashlib
+import re, hashlib
 import streamlit as st
-import pyodbc
 import pandas as pd
-from dotenv import load_dotenv
 from datetime import date
 import requests
-from sqlalchemy import create_engine
-import urllib
 from sqlalchemy import text
-from functools import lru_cache
-import time
-import requests
 from sqlalchemy.exc import IntegrityError
+import time
+
 from ui import sidebar_logo
+from db import get_engine
 
 sidebar_logo()
-load_dotenv()
 
 PERFIS = ["Decisor", "Influenciador"]
 
-@lru_cache
-def get_engine():
-    conn_str = (
-        "Driver={ODBC Driver 18 for SQL Server};"
-        f"Server=tcp:{os.environ.get('SQL_SERVER','')},1433;"
-        f"Database={os.environ.get('SQL_DB','')};"
-        f"Uid={os.environ.get('SQL_USER','')};"
-        f"Pwd={os.environ.get('SQL_PASSWORD','')};"
-        "Encrypt=yes;"
-        "TrustServerCertificate=yes;"
-        "MARS_Connection=yes;"
-        "Connection Timeout=30;"
-    )
-
-    params = urllib.parse.quote_plus(conn_str)
-
-    return create_engine(
-        f"mssql+pyodbc:///?odbc_connect={params}",
-        pool_pre_ping=True,
-        pool_recycle=1800
-    )
-
-N8N_FORCE_URL = os.environ.get(
-    "N8N_FORCE_URL",
-    "https://sai-marketing.app.n8n.cloud/webhook/10e983d1-9edb-459e-b6af-dc8950a8172b"
-).strip()
+# Agora vem do secrets.toml
+N8N_FORCE_URL = (st.secrets.get("N8N_FORCE_URL") or "").strip()
 
 def disparar_n8n_force(cliente_id: str) -> tuple[bool, str, dict]:
     base_url = (N8N_FORCE_URL or "").strip()
@@ -124,28 +95,31 @@ def make_cliente_id(email: str, empresa: str) -> str:
 
 def load_clientes(q: str, ativo: str, perfil: str, topn: int):
     where = []
-    params = {}   # <-- dict, sem topn
+    params = []  # lista na ordem dos ? (pyodbc)
 
     if ativo == "Ativos":
-        where.append("c.ativo = 1")
+        where.append("c.ativo = ?")
+        params.append(1)
     elif ativo == "Inativos":
-        where.append("c.ativo = 0")
+        where.append("c.ativo = ?")
+        params.append(0)
 
     if perfil in PERFIS:
-        where.append("c.perfil_decisor = :perfil")
-        params["perfil"] = perfil
+        where.append("c.perfil_decisor = ?")
+        params.append(perfil)
 
     if q.strip():
+        like = f"%{q.strip().lower()}%"
+        like_id = f"%{q.strip()}%"
         where.append("""
         (
-          LOWER(c.nome) LIKE :like OR
-          LOWER(c.email) LIKE :like OR
-          LOWER(c.empresa) LIKE :like OR
-          CAST(c.cliente_id AS NVARCHAR(100)) LIKE :like_id
+          LOWER(c.nome) LIKE ? OR
+          LOWER(c.email) LIKE ? OR
+          LOWER(c.empresa) LIKE ? OR
+          CAST(c.cliente_id AS NVARCHAR(100)) LIKE ?
         )
         """)
-        params["like"] = f"%{q.strip().lower()}%"
-        params["like_id"] = f"%{q.strip()}%"
+        params.extend([like, like, like, like_id])
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
@@ -172,14 +146,8 @@ def load_clientes(q: str, ativo: str, perfil: str, topn: int):
     """
 
     engine = get_engine()
-
-    # ✅ Só passa params se tiver algum
-    df = pd.read_sql(sql, engine, params=params if params else None)
+    df = pd.read_sql(sql, engine, params=tuple(params) if params else None)
     return df
-
-    dups = df.columns[df.columns.duplicated()].tolist()
-    st.write("Colunas duplicadas:", dups)
-    st.write("Total colunas:", len(df.columns), "Únicas:", len(set(df.columns)))
 
 def wait_status_update(cliente_id: str, timeout_s: int = 15, every_s: float = 1.0):
     """
@@ -194,7 +162,8 @@ def wait_status_update(cliente_id: str, timeout_s: int = 15, every_s: float = 1.
         if not row:
             return False, {"stage": "not_found"}
 
-        status = (row.get("status_envio") or "").strip()
+        v = row.get("status_envio")
+        status = "" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip()
         ultimo = row.get("ultimo_envio")
         ultimo_s = str(ultimo)[:10] if ultimo else ""
 
@@ -373,57 +342,57 @@ if "updated_at" in df.columns:
 df = df.drop_duplicates(subset=["cliente_id"], keep="first").copy()
 
 def indicador_envio_row(row):
-    hoje = date.today()
 
-    ativo = int(row.get("ativo") or 0)
-    status = (row.get("status_envio") or "").strip()
-    exec_status = (row.get("status_execucao") or "").strip()
-    exec_id = (row.get("last_execution_id") or "")
-    ultimo_erro = (row.get("ultimo_erro") or "").strip()
+    ativo_val = row.get("ativo")
+    ativo = 0 if ativo_val is None or (isinstance(ativo_val, float) and pd.isna(ativo_val)) else int(ativo_val)
 
-    proximo = row.get("proximo_envio")
-    ultimo = row.get("ultimo_envio")
+    status_val = row.get("status_envio")
+    status = "" if status_val is None or (isinstance(status_val, float) and pd.isna(status_val)) else str(status_val).strip()
 
-    def to_date(v):
-        if v is None or v == "" or (isinstance(v, float) and pd.isna(v)):
-            return None
-        try:
-            return pd.to_datetime(v).date()
-        except Exception:
-            return None
+    exec_val = row.get("status_execucao")
+    execucao = "" if exec_val is None else str(exec_val).strip()
 
-    proximo_d = to_date(proximo)
-    ultimo_d = to_date(ultimo)
+    erro_val = row.get("ultimo_erro")
+    ultimo_erro = "" if erro_val is None else str(erro_val).strip()
+
 
     # Inativo
-    if ativo != 1:
-        return "⚪ Inativo"
+    if ativo == 0:
+        return "⛔ Inativo"
 
-    # Execução em andamento (prioridade máxima)
-    if exec_status.lower() == "processando":
-        return f"🚀 Processando" + (f" (Exec: {exec_id})" if exec_id else "")
 
-    # Execução com erro (mostra erro se tiver)
-    if exec_status.lower() == "erro":
-        return "🔴 Erro Execução" + (f" • {ultimo_erro[:60]}" if ultimo_erro else "")
+    # Executando (n8n rodando)
+    if execucao in ("running","executando","processing"):
+        return "🔄 Enviando"
 
-    # Enviado hoje
-    if status.lower() == "enviado" and ultimo_d == hoje:
-        return "📨 Enviado hoje"
 
-    # Elegível
-    if status in ("Pendente", "Erro") and (proximo_d is None or proximo_d <= hoje):
+    # Forçado elegível ou pendente
+    if status in ("Pendente","Elegível",""):
         return "🟢 Elegível"
 
-    # Aguardando (próximo ciclo)
-    if proximo_d and proximo_d > hoje:
-        dias = (proximo_d - hoje).days
-        return f"🟡 Próximo ciclo em {dias}d"
 
-    return "🟡 Aguardando"
+    # Falha
+    if status == "Falha" or ultimo_erro:
+        return "❌ Falha"
+
+
+    # Enviado
+    if status == "Enviado":
+        return "✅ Enviado"
+
+
+    return "—"
 
 # ✅ garante 1 coluna (Series) SEM chance de virar DataFrame
-df["indicador_envio"] = df.apply(indicador_envio_row, axis=1).astype(str)
+tmp = df.apply(indicador_envio_row, axis=1)
+
+if isinstance(tmp, pd.DataFrame):
+    st.error("indicador_envio_row retornou múltiplos campos em alguma linha.")
+    st.write("Colunas geradas:", list(tmp.columns))
+    st.dataframe(tmp.head(), use_container_width=True)
+    tmp = tmp.astype(str).agg(" | ".join, axis=1)
+
+df["indicador_envio"] = tmp.astype(str)
 
 # -------- Indicadores topo --------
 
