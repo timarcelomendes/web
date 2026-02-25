@@ -4,3 +4,5 @@ curl
 gnupg
 apt-transport-https
 ca-certificates
+build-essential
+g++
