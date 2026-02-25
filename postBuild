@@ -1,12 +1,15 @@
 #!/bin/bash
 set -e
 
-# Microsoft repo (Debian/Ubuntu base)
-curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add -
-curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list
+apt-get update
+apt-get install -y curl gnupg2 apt-transport-https ca-certificates
+
+# Importa chave da Microsoft
+curl -sSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /usr/share/keyrings/microsoft.gpg
+
+# Repo MS (Debian 11)
+echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/11/prod bullseye main" \
+> /etc/apt/sources.list.d/mssql-release.list
 
 apt-get update
-ACCEPT_EULA=Y apt-get install -y msodbcsql18
-
-# opcional: ferramentas
-# ACCEPT_EULA=Y apt-get install -y mssql-tools18
+ACCEPT_EULA=Y apt-get install -y msodbcsql18 unixodbc
