@@ -1,0 +1,6 @@
+unixodbc
+unixodbc-dev
+curl
+gnupg
+apt-transport-https
+ca-certificates
