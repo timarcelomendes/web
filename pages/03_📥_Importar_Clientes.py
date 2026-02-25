@@ -12,6 +12,7 @@ import urllib
 from functools import lru_cache
 import hashlib
 from ui import sidebar_logo
+from db import get_engine
 
 sidebar_logo()
 load_dotenv()
@@ -19,26 +20,6 @@ load_dotenv()
 APP_TITLE = "Importar Clientes — NPS POC"
 
 PERFIS = ["Decisor", "Influenciador"]
-
-@lru_cache
-def get_engine():
-    conn_str = (
-        "Driver={ODBC Driver 18 for SQL Server};"
-        f"Server=tcp:{os.environ.get('SQL_SERVER','')},1433;"
-        f"Database={os.environ.get('SQL_DB','')};"
-        f"Uid={os.environ.get('SQL_USER','')};"
-        f"Pwd={os.environ.get('SQL_PASSWORD','')};"
-        "Encrypt=yes;"
-        "TrustServerCertificate=yes;"
-        "MARS_Connection=yes;"
-        "Connection Timeout=30;"
-    )
-    params = urllib.parse.quote_plus(conn_str)
-    return create_engine(
-        f"mssql+pyodbc:///?odbc_connect={params}",
-        pool_pre_ping=True,
-        pool_recycle=1800
-    )
 
 def conn_healthcheck():
     try:
