@@ -1,6 +1,6 @@
 import time
 from datetime import datetime
-
+from db import detect_odbc_driver
 import streamlit as st
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -121,7 +121,7 @@ k3.metric(
 
 k4.metric(
     "Driver",
-    "ODBC 18"
+    detect_odbc_driver()
 )
 
 

@@ -1,7 +1,18 @@
 import urllib.parse
 import streamlit as st
 from sqlalchemy import create_engine, text
+import subprocess
 
+def detect_odbc_driver():
+    try:
+        drivers = subprocess.getoutput("odbcinst -q -d")
+        if "ODBC Driver 18 for SQL Server" in drivers:
+            return "ODBC 18"
+        if "ODBC Driver 17 for SQL Server" in drivers:
+            return "ODBC 17"
+    except Exception:
+        pass
+    return "ODBC ?"
 
 @st.cache_resource
 def _engine(conn_key: str, odbc_connect: str):
