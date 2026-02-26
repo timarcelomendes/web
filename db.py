@@ -14,7 +14,6 @@ def detect_odbc_driver():
         pass
     return "ODBC ?"
 
-
 def exec_sql(sql: str, params: dict | None = None):
     engine = get_engine()
     with engine.begin() as conn:
