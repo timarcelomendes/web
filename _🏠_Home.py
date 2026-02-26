@@ -1,16 +1,14 @@
 import time
-from datetime import datetime
-from db import detect_odbc_driver
+from datetime import datetime, timedelta, date
+import pandas as pd
 import streamlit as st
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
+
 from ui import sidebar_logo, sidebar_info, configurar_layout
 from db import get_engine
-import pandas as pd
-
 
 configurar_layout()
-
 sidebar_logo()
 sidebar_info()
 
@@ -19,289 +17,418 @@ TZ_LABEL = "Horário local"
 
 
 # =========================
-# Healthcheck conexão
+# Helpers
 # =========================
 
-def conn_healthcheck():
-    t0 = time.time()
-    try:
-        engine = get_engine()
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
-
-        ms = int((time.time() - t0) * 1000)
-        return {"ok": True, "ms": ms, "err": None, "hint": None, "engine": engine}
-
-    except SQLAlchemyError as e:
-        ms = int((time.time() - t0) * 1000)
-        msg = str(e)
-
-        hint = None
-        if "Login failed" in msg or "(18456)" in msg:
-            hint = "Credenciais inválidas (Secrets)."
-        elif "(40615)" in msg or "not allowed to access the server" in msg:
-            hint = "Firewall do Azure SQL bloqueando o IP do Streamlit Cloud."
-        elif "Can't open lib" in msg or "file not found" in msg:
-            hint = "Driver ODBC não está instalado no ambiente."
-        elif "timeout" in msg.lower() or "hyt00" in msg.lower():
-            hint = "Timeout: firewall/rede/DNS."
-
-        return {"ok": False, "ms": ms, "err": msg, "hint": hint, "engine": None}
-
-@st.cache_data(ttl=60)
-def load_nps_kpis(_engine, cache_key: str):
-    sql = text("""
-        WITH base AS (
-            SELECT CAST(r.nota AS INT) AS nota, r.created_at
-            FROM dbo.nps_respostas r
-        ),
-        all_time AS (
-            SELECT
-                COUNT(1) AS total_respostas,
-                SUM(CASE WHEN nota BETWEEN 9 AND 10 THEN 1 ELSE 0 END) AS promotores,
-                SUM(CASE WHEN nota BETWEEN 7 AND 8 THEN 1 ELSE 0 END) AS neutros,
-                SUM(CASE WHEN nota BETWEEN 0 AND 6 THEN 1 ELSE 0 END) AS detratores
-            FROM base
-        ),
-        last7 AS (
-            SELECT
-                COUNT(1) AS total_respostas_7d,
-                SUM(CASE WHEN nota BETWEEN 9 AND 10 THEN 1 ELSE 0 END) AS promotores_7d,
-                SUM(CASE WHEN nota BETWEEN 7 AND 8 THEN 1 ELSE 0 END) AS neutros_7d,
-                SUM(CASE WHEN nota BETWEEN 0 AND 6 THEN 1 ELSE 0 END) AS detratores_7d
-            FROM base
-            WHERE created_at >= DATEADD(day, -7, GETDATE())
-        )
-        SELECT
-            a.total_respostas,
-            a.promotores, a.neutros, a.detratores,
-            CAST(
-                CASE WHEN a.total_respostas = 0 THEN 0
-                     ELSE ((a.promotores*100.0/a.total_respostas) - (a.detratores*100.0/a.total_respostas))
-                END AS DECIMAL(10,1)
-            ) AS nps_geral,
-
-            l.total_respostas_7d,
-            l.promotores_7d, l.neutros_7d, l.detratores_7d,
-            CAST(
-                CASE WHEN l.total_respostas_7d = 0 THEN 0
-                     ELSE ((l.promotores_7d*100.0/l.total_respostas_7d) - (l.detratores_7d*100.0/l.total_respostas_7d))
-                END AS DECIMAL(10,1)
-            ) AS nps_7d
-        FROM all_time a
-        CROSS JOIN last7 l;
-    """)
-    return pd.read_sql(sql, _engine).iloc[0]
-
-
-def pct(part: int, total: int) -> float:
-    return 0.0 if total <= 0 else (part * 100.0 / total)
-
-
 def nps_badge(nps: float) -> tuple[str, str]:
-    # label, emoji (simples e efetivo)
     if nps >= 50:
         return "Excelente", "🟢"
     if nps >= 0:
         return "Atenção", "🟡"
     return "Crítico", "🔴"
 
+
+def pct(part: int, total: int) -> float:
+    return 0.0 if total <= 0 else (part * 100.0 / total)
+
+
+def to_date(v) -> date | None:
+    if v is None or v == "":
+        return None
+    if isinstance(v, date):
+        return v
+    try:
+        return pd.to_datetime(v).date()
+    except Exception:
+        return None
+
+
+@st.cache_resource
+def get_db_engine():
+    return get_engine()
+
+
+@st.cache_data(ttl=60)
+def load_empresas(cache_key: str) -> list[str]:
+    engine = get_db_engine()
+    sql = text("""
+        SELECT DISTINCT TOP (500) LTRIM(RTRIM(empresa)) AS empresa
+        FROM dbo.nps_respostas
+        WHERE empresa IS NOT NULL AND LTRIM(RTRIM(empresa)) <> ''
+        ORDER BY empresa ASC;
+    """)
+    df = pd.read_sql(sql, engine)
+    return df["empresa"].dropna().astype(str).tolist()
+
+
+@st.cache_data(ttl=60)
+def load_kpis_periodo(cache_key: str, empresa: str | None, dias: int) -> dict:
+    """
+    Retorna KPIs para:
+      - janela atual: últimos {dias} dias
+      - janela anterior: {dias} dias anteriores
+      - geral (all time)
+    """
+    engine = get_db_engine()
+
+    where_empresa = ""
+    params: dict = {"dias": int(dias)}
+    if empresa and empresa != "Todas":
+        where_empresa = "AND LTRIM(RTRIM(empresa)) = :empresa"
+        params["empresa"] = empresa
+
+    sql = text(f"""
+        WITH base AS (
+            SELECT
+                CAST(nota AS INT) AS nota,
+                CAST(created_at AS DATETIME2) AS created_at,
+                LTRIM(RTRIM(empresa)) AS empresa
+            FROM dbo.nps_respostas
+            WHERE deleted_at IS NULL OR deleted_at IS NULL  -- compat: se não existir, não quebra no SQL Server? (ignorará apenas se existir)
+        ),
+        scope AS (
+            SELECT *
+            FROM base
+            WHERE 1=1
+            {where_empresa}
+        ),
+        all_time AS (
+            SELECT
+                COUNT(1) AS total,
+                SUM(CASE WHEN nota BETWEEN 9 AND 10 THEN 1 ELSE 0 END) AS prom,
+                SUM(CASE WHEN nota BETWEEN 7 AND 8 THEN 1 ELSE 0 END) AS neu,
+                SUM(CASE WHEN nota BETWEEN 0 AND 6 THEN 1 ELSE 0 END) AS det
+            FROM scope
+        ),
+        cur AS (
+            SELECT
+                COUNT(1) AS total,
+                SUM(CASE WHEN nota BETWEEN 9 AND 10 THEN 1 ELSE 0 END) AS prom,
+                SUM(CASE WHEN nota BETWEEN 7 AND 8 THEN 1 ELSE 0 END) AS neu,
+                SUM(CASE WHEN nota BETWEEN 0 AND 6 THEN 1 ELSE 0 END) AS det
+            FROM scope
+            WHERE created_at >= DATEADD(day, -:dias, GETDATE())
+        ),
+        prev AS (
+            SELECT
+                COUNT(1) AS total,
+                SUM(CASE WHEN nota BETWEEN 9 AND 10 THEN 1 ELSE 0 END) AS prom,
+                SUM(CASE WHEN nota BETWEEN 7 AND 8 THEN 1 ELSE 0 END) AS neu,
+                SUM(CASE WHEN nota BETWEEN 0 AND 6 THEN 1 ELSE 0 END) AS det
+            FROM scope
+            WHERE created_at >= DATEADD(day, -(:dias*2), GETDATE())
+              AND created_at <  DATEADD(day, -:dias, GETDATE())
+        )
+        SELECT
+            a.total AS total_all, a.prom AS prom_all, a.neu AS neu_all, a.det AS det_all,
+            c.total AS total_cur, c.prom AS prom_cur, c.neu AS neu_cur, c.det AS det_cur,
+            p.total AS total_prev, p.prom AS prom_prev, p.neu AS neu_prev, p.det AS det_prev
+        FROM all_time a
+        CROSS JOIN cur c
+        CROSS JOIN prev p;
+    """)
+
+    try:
+        row = pd.read_sql(sql, engine, params=params).iloc[0].to_dict()
+    except Exception as e:
+        raise
+
+    def calc_nps(prom: int, det: int, total: int) -> float:
+        if not total:
+            return 0.0
+        return (prom * 100.0 / total) - (det * 100.0 / total)
+
+    total_cur = int(row.get("total_cur") or 0)
+    total_prev = int(row.get("total_prev") or 0)
+    total_all = int(row.get("total_all") or 0)
+
+    prom_cur = int(row.get("prom_cur") or 0)
+    neu_cur = int(row.get("neu_cur") or 0)
+    det_cur = int(row.get("det_cur") or 0)
+
+    prom_prev = int(row.get("prom_prev") or 0)
+    neu_prev = int(row.get("neu_prev") or 0)
+    det_prev = int(row.get("det_prev") or 0)
+
+    prom_all = int(row.get("prom_all") or 0)
+    neu_all = int(row.get("neu_all") or 0)
+    det_all = int(row.get("det_all") or 0)
+
+    nps_cur = round(calc_nps(prom_cur, det_cur, total_cur), 1)
+    nps_prev = round(calc_nps(prom_prev, det_prev, total_prev), 1)
+    nps_all = round(calc_nps(prom_all, det_all, total_all), 1)
+
+    return {
+        "total_cur": total_cur,
+        "total_prev": total_prev,
+        "total_all": total_all,
+        "prom_cur": prom_cur,
+        "neu_cur": neu_cur,
+        "det_cur": det_cur,
+        "prom_prev": prom_prev,
+        "neu_prev": neu_prev,
+        "det_prev": det_prev,
+        "nps_cur": nps_cur,
+        "nps_prev": nps_prev,
+        "nps_all": nps_all,
+        "prom_pct_cur": round(pct(prom_cur, total_cur), 1),
+        "neu_pct_cur": round(pct(neu_cur, total_cur), 1),
+        "det_pct_cur": round(pct(det_cur, total_cur), 1),
+        "prom_pct_prev": round(pct(prom_prev, total_prev), 1),
+        "neu_pct_prev": round(pct(neu_prev, total_prev), 1),
+        "det_pct_prev": round(pct(det_prev, total_prev), 1),
+    }
+
+
+@st.cache_data(ttl=60)
+def load_series_diaria(cache_key: str, empresa: str | None, dias: int) -> pd.DataFrame:
+    """
+    Série diária dos últimos 2*dias, para gráfico e comparação.
+    """
+    engine = get_db_engine()
+
+    where_empresa = ""
+    params: dict = {"dias": int(dias)}
+    if empresa and empresa != "Todas":
+        where_empresa = "AND LTRIM(RTRIM(empresa)) = :empresa"
+        params["empresa"] = empresa
+
+    sql = text(f"""
+        WITH scope AS (
+            SELECT
+                CAST(created_at AS DATE) AS dt,
+                CAST(nota AS INT) AS nota
+            FROM dbo.nps_respostas
+            WHERE created_at >= DATEADD(day, -(:dias*2), CAST(GETDATE() AS DATE))
+            {where_empresa}
+        )
+        SELECT
+            dt,
+            COUNT(1) AS total,
+            SUM(CASE WHEN nota BETWEEN 9 AND 10 THEN 1 ELSE 0 END) AS prom,
+            SUM(CASE WHEN nota BETWEEN 0 AND 6 THEN 1 ELSE 0 END) AS det
+        FROM scope
+        GROUP BY dt
+        ORDER BY dt ASC;
+    """)
+    df = pd.read_sql(sql, engine, params=params)
+    if df.empty:
+        return df
+
+    df["nps"] = df.apply(lambda r: 0.0 if r["total"] == 0 else (r["prom"]*100.0/r["total"] - r["det"]*100.0/r["total"]), axis=1)
+    df["nps"] = df["nps"].round(1)
+    return df
+
+
 # =========================
 # HOME
 # =========================
 
-st.set_page_config(
-    page_title=APP_TITLE,
-    layout="wide"
-)
-
+st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title("🧭 NPS Admin (POC)")
 
-top_left, top_mid, top_right = st.columns([3,1,1])
+top_left, top_right = st.columns([4, 1])
 
 with top_left:
-
-    st.caption(
-        "Painel inicial. Use as páginas para operar dados."
-    )
-
-with top_mid:
-
-    if st.button("🔄 Revalidar conexão", use_container_width=True):
-
-        st.cache_resource.clear()
-        st.rerun()
+    st.caption("Painel inicial. Use as páginas para operar dados.")
 
 with top_right:
-
-    st.caption(
-        f"{TZ_LABEL}: **{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}**"
-    )
-
-
-# =========================
-# Healthcheck
-# =========================
-
-hc = conn_healthcheck()
-
-k1,k2,k3,k4 = st.columns(4)
-
-k1.metric(
-    "Banco",
-    "Online ✅" if hc["ok"] else "Offline ❌"
-)
-
-k2.metric(
-    "Latência",
-    f'{hc["ms"]} ms'
-)
-
-k3.metric(
-    "Ambiente",
-    st.secrets.get("ENV","local")
-)
-
-k4.metric(
-    "Driver",
-    detect_odbc_driver()
-)
-
-
-if not hc["ok"]:
-
-    st.error("Sem conexão com Azure SQL")
-
-    st.code(hc["err"])
-
-    if hc["hint"]:
-        st.warning(hc["hint"])
-
-    st.stop()
-
-# =========================
-# KPIs NPS
-# =========================
-
-# =========================
-# KPIs NPS
-# =========================
-
-engine = hc["engine"]  # ✅ usa o engine validado no healthcheck
-
-cache_key = f'{st.secrets.get("SQL_SERVER","")}|{st.secrets.get("SQL_DB","")}'
-kpi = load_nps_kpis(engine, cache_key)
-
-nps_geral = float(kpi["nps_geral"] or 0)
-nps_7d = float(kpi["nps_7d"] or 0)
-
-total = int(kpi["total_respostas"] or 0)
-total_7d = int(kpi["total_respostas_7d"] or 0)
-
-prom = int(kpi["promotores"] or 0)
-neu  = int(kpi["neutros"] or 0)
-det  = int(kpi["detratores"] or 0)
-
-prom7 = int(kpi["promotores_7d"] or 0)
-neu7  = int(kpi["neutros_7d"] or 0)
-det7  = int(kpi["detratores_7d"] or 0)
-
-prom_p = pct(prom, total)
-neu_p  = pct(neu, total)
-det_p  = pct(det, total)
-
-prom_p7 = pct(prom7, total_7d)
-neu_p7  = pct(neu7, total_7d)
-det_p7  = pct(det7, total_7d)
-
-label, emoji = nps_badge(nps_geral)
-
-# deltas reais vs 7 dias
-nps_delta = nps_geral - nps_7d
-resp_delta = total - total_7d
-prom_delta = prom_p - prom_p7
-neu_delta  = neu_p - neu_p7
-det_delta  = det_p - det_p7
+    st.caption(f"{TZ_LABEL}: **{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}**")
 
 st.divider()
 
-head_left, head_mid, head_right = st.columns([4, 1.2, 1.2])
+# =========================
+# Filtros (Período + Empresa)
+# =========================
 
-with head_left:
-    st.subheader("📊 Indicadores NPS (Geral)")
-    st.caption(
-        f"{emoji} **{label}**  •  Atualizado: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}"
+f1, f2, f3 = st.columns([1.2, 2.2, 1])
+
+with f1:
+    dias = st.selectbox(
+        "Período de comparação",
+        [7, 14, 30, 60, 90],
+        index=0,
+        format_func=lambda x: f"Últimos {x} dias",
+        key="home_dias",
     )
 
-with head_mid:
-    if st.button("🔄 Atualizar KPIs", use_container_width=True):
-        load_nps_kpis.clear()
+with f2:
+    cache_key = f'{st.secrets.get("SQL_SERVER","")} | {st.secrets.get("SQL_DB","")}'
+    try:
+        empresas = ["Todas"] + load_empresas(cache_key)
+    except Exception:
+        empresas = ["Todas"]
+    empresa = st.selectbox("Empresa", empresas, index=0, key="home_empresa")
+
+with f3:
+    if st.button("🔄 Atualizar", use_container_width=True, key="home_refresh"):
+        load_kpis_periodo.clear()
+        load_series_diaria.clear()
         st.rerun()
 
-with head_right:
-    st.caption("Comparação")
-    st.write("Últimos **7 dias**")
+# =========================
+# Dados e KPIs
+# =========================
+
+try:
+    kpi = load_kpis_periodo(cache_key, empresa, int(dias))
+    serie = load_series_diaria(cache_key, empresa, int(dias))
+except SQLAlchemyError as e:
+    st.error("Sem conexão com o banco (verifique em Status de Conexão).")
+    st.code(str(e)[:1200])
+    st.stop()
+except Exception as e:
+    st.error("Erro ao carregar indicadores.")
+    st.code(str(e)[:1200])
+    st.stop()
+
+nps_cur = float(kpi["nps_cur"])
+nps_prev = float(kpi["nps_prev"])
+nps_all = float(kpi["nps_all"])
+
+total_cur = int(kpi["total_cur"])
+total_prev = int(kpi["total_prev"])
+
+prom_cur = int(kpi["prom_cur"])
+neu_cur = int(kpi["neu_cur"])
+det_cur = int(kpi["det_cur"])
+
+prom_pct_cur = float(kpi["prom_pct_cur"])
+neu_pct_cur = float(kpi["neu_pct_cur"])
+det_pct_cur = float(kpi["det_pct_cur"])
+
+prom_pct_prev = float(kpi["prom_pct_prev"])
+neu_pct_prev = float(kpi["neu_pct_prev"])
+det_pct_prev = float(kpi["det_pct_prev"])
+
+label, emoji = nps_badge(nps_cur)
+
+# Deltas (janela atual vs anterior do mesmo tamanho)
+nps_delta = round(nps_cur - nps_prev, 1)
+resp_delta = total_cur - total_prev
+prom_delta_pp = round(prom_pct_cur - prom_pct_prev, 1)
+neu_delta_pp = round(neu_pct_cur - neu_pct_prev, 1)
+det_delta_pp = round(det_pct_cur - det_pct_prev, 1)
+
+st.subheader("📊 Indicadores NPS")
+st.caption(f"{emoji} **{label}** • Comparando: últimos **{dias} dias** vs **{dias} dias anteriores**" + ("" if empresa == "Todas" else f" • Empresa: **{empresa}**"))
 
 m1, m2, m3, m4, m5 = st.columns(5)
 
-m1.metric("NPS Geral", f"{nps_geral:.1f}", delta=f"{nps_delta:+.1f} vs 7d", help="NPS = %Promotores - %Detratores")
-m2.metric("Respostas", f"{total}", delta=f"{resp_delta:+d} vs 7d")
-m3.metric("🟢 Promotores", f"{prom} ({prom_p:.1f}%)", delta=f"{prom_delta:+.1f} p.p.")
-m4.metric("🟡 Neutros", f"{neu} ({neu_p:.1f}%)", delta=f"{neu_delta:+.1f} p.p.")
-m5.metric("🔴 Detratores", f"{det} ({det_p:.1f}%)", delta=f"{det_delta:+.1f} p.p.")
-
-# Linha “premium” extra, sem poluir: resumo do 7d
-st.caption(
-    f"📅 Últimos 7 dias: **NPS {nps_7d:.1f}** | **{total_7d} respostas** | "
-    f"🟢 {prom7} ({prom_p7:.1f}%) • 🟡 {neu7} ({neu_p7:.1f}%) • 🔴 {det7} ({det_p7:.1f}%)"
+# 1) NPS com delta (melhor visual com sinal e delta_color)
+m1.metric(
+    "NPS (janela)",
+    f"{nps_cur:.1f}",
+    delta=f"{nps_delta:+.1f}",
+    delta_color="normal",
+    help="NPS = %Promotores - %Detratores",
 )
 
-# Gauge simples (bem discreto)
-gauge = max(0.0, min(1.0, (nps_geral + 100.0) / 200.0))
+# 2) Volume de respostas
+m2.metric(
+    "Respostas",
+    f"{total_cur}",
+    delta=f"{resp_delta:+d}",
+    delta_color="normal",
+)
+
+# 3) Promotores (bom subir)
+m3.metric(
+    "🟢 Promotores",
+    f"{prom_cur} ({prom_pct_cur:.1f}%)",
+    delta=f"{prom_delta_pp:+.1f} p.p.",
+    delta_color="normal",
+)
+
+# 4) Neutros (delta sem cor forte)
+m4.metric(
+    "🟡 Neutros",
+    f"{neu_cur} ({neu_pct_cur:.1f}%)",
+    delta=f"{neu_delta_pp:+.1f} p.p.",
+    delta_color="off",
+)
+
+# 5) Detratores (ruim subir → inverse)
+m5.metric(
+    "🔴 Detratores",
+    f"{det_cur} ({det_pct_cur:.1f}%)",
+    delta=f"{det_delta_pp:+.1f} p.p.",
+    delta_color="inverse",
+)
+
+# NPS geral (all time) como referência
+st.caption(f"Referência: **NPS geral {nps_all:.1f}** (todo o histórico)")
+
+# Gauge discreto
+gauge = max(0.0, min(1.0, (nps_cur + 100.0) / 200.0))
 st.progress(gauge)
 st.caption("NPS Gauge: -100 → 0 → 100")
+
+st.divider()
+
+# =========================
+# Gráfico (comparação período atual vs anterior)
+# =========================
+
+st.subheader("📈 Tendência diária")
+
+if serie is None or serie.empty:
+    st.info("Sem dados suficientes para gerar a tendência diária nesse período.")
+else:
+    # cria duas janelas (2*dias) e marca qual período
+    df = serie.copy()
+    df["dt"] = pd.to_datetime(df["dt"]).dt.date
+
+    today = datetime.now().date()
+    start_cur = today - timedelta(days=int(dias))
+    start_prev = today - timedelta(days=int(dias) * 2)
+
+    df["periodo"] = df["dt"].apply(lambda d: "Atual" if d >= start_cur else "Anterior")
+
+    # Alinha por "dia relativo" dentro da janela (1..dias)
+    def day_index(d: date) -> int:
+        if d >= start_cur:
+            return (d - start_cur).days + 1
+        return (d - start_prev).days + 1
+
+    df["dia"] = df["dt"].apply(day_index)
+
+    pivot_nps = df.pivot_table(index="dia", columns="periodo", values="nps", aggfunc="mean").sort_index()
+    pivot_cnt = df.pivot_table(index="dia", columns="periodo", values="total", aggfunc="sum").sort_index()
+
+    cA, cB = st.columns(2)
+
+    with cA:
+        st.caption("NPS diário (janela atual vs anterior)")
+        st.line_chart(pivot_nps, height=240)
+
+    with cB:
+        st.caption("Respostas/dia (janela atual vs anterior)")
+        st.line_chart(pivot_cnt, height=240)
+
+st.divider()
 
 # =========================
 # Navegação
 # =========================
 
-st.divider()
-
 st.subheader("O que você quer fazer agora?")
-
 
 def card(title, desc, button, page, icon):
     with st.container(border=True):
         left, right = st.columns([6,2])
-
         with left:
             st.markdown(f"### {icon} {title}")
             st.caption(desc)
-
         with right:
             st.write("")
             if st.button(button, use_container_width=True, type="primary"):
                 st.switch_page(page)
 
-colA,colB = st.columns(2)
+colA, colB = st.columns(2)
 
 with colA:
-
-    card(
-        "Clientes",
-        "Cadastro e ações",
-        "Abrir Clientes →",
-        "pages/01_👤_Clientes.py",
-        "👥"
-    )
-
+    card("Clientes", "Cadastro e ações", "Abrir Clientes →", "pages/01_👤_Clientes.py", "👥")
 
 with colB:
-
-    card(
-        "Respostas",
-        "Auditoria de respostas",
-        "Abrir Respostas →",
-        "pages/02_📨_Respostas.py",
-        "📩"
-    )
+    card("Respostas", "Auditoria de respostas", "Abrir Respostas →", "pages/02_📨_Respostas.py", "📩")
