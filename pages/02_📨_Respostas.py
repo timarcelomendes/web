@@ -53,8 +53,10 @@ def load_respostas(empresa, categoria, q, dt_ini, dt_fim, incluir_excluidas, top
 
     sql = f"""
     SELECT TOP ({int(topn)})
-      resposta_id, cliente_id, email, empresa, data_resposta, nota,
-      categoria, motivo, canal, deleted_at, created_at
+    resposta_id, cliente_id, email, empresa, data_resposta, nota,
+    categoria, motivo, canal,
+    jira_issue_key, jira_issue_url,
+    deleted_at, created_at
     FROM dbo.nps_respostas
     {where_sql}
     ORDER BY data_resposta DESC, created_at DESC;
@@ -65,7 +67,7 @@ def load_respostas(empresa, categoria, q, dt_ini, dt_fim, incluir_excluidas, top
     def cat_badge(c):
         return "🟩 Promotor" if c == "Promotor" else ("🟨 Neutro" if c == "Neutro" else ("🟥 Detrator" if c == "Detrator" else "⬜"))
     df["categoria_badge"] = df["categoria"].apply(cat_badge) if "categoria" in df.columns else ""
-    df["status"] = df["deleted_at"].apply(lambda x: "🟢 Ativo" if pd.isna(x) else "⚫ Excluído")
+    df["status"] = df["deleted_at"].apply(lambda x: "🟢 Ativa" if pd.isna(x) else "⚫ Excluído")
     return df
 
 def load_one(resposta_id):
@@ -123,22 +125,71 @@ with st.sidebar:
 
 cat_param = "" if categoria == "Todos" else categoria
 df = load_respostas(empresa, cat_param, q, dt_ini, dt_fim, incluir_excluidas, int(topn))
+cat_param = "" if categoria == "Todos" else categoria
+df = load_respostas(empresa, cat_param, q, dt_ini, dt_fim, incluir_excluidas, int(topn))
+
+def truncate_motivo(text, limit=120):
+    if text is None:
+        return ""
+    text = str(text).strip()
+    return text[:limit] + "..." if len(text) > limit else text
+
+if not df.empty:
+    df["motivo_resumo"] = df["motivo"].apply(truncate_motivo) if "motivo" in df.columns else ""
+else:
+    df["motivo_resumo"] = ""
 
 k1, k2, k3 = st.columns(3)
 k1.metric("Respostas na lista", int(len(df)))
-k2.metric("Ativas", int((df["status"] == "🟢 Ativo").sum()) if "status" in df else 0)
+k2.metric("Ativas", int((df["status"] == "🟢 Ativa").sum()) if "status" in df else 0)
 k3.metric("Excluídas", int((df["status"] == "⚫ Excluído").sum()) if "status" in df else 0)
 
 st.subheader("Lista")
-cols = ["resposta_id","data_resposta","empresa","email","nota","categoria_badge","status","created_at"]
+cols = [
+    "resposta_id",
+    "data_resposta",
+    "empresa",
+    "email",
+    "nota",
+    "categoria_badge",
+    "motivo_resumo",
+    "jira_issue_url",
+    "status",
+    "created_at"
+]
 cols = [c for c in cols if c in df.columns]
-st.dataframe(df[cols], use_container_width=True, hide_index=True)
+st.dataframe(
+    df[cols],
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "jira_issue_url": st.column_config.LinkColumn(
+            "Jira",
+            display_text="🔗 Abrir",
+        )
+    }
+)
 
 st.divider()
 
 st.subheader("Ações")
 ids = df["resposta_id"].tolist() if not df.empty else []
-selected = st.selectbox("Selecionar resposta", ids, key="resp_selected") if ids else None
+
+def format_option(resposta_id):
+    row = df[df["resposta_id"] == resposta_id].iloc[0]
+    email = row.get("email") or "-"
+    empresa = row.get("empresa") or "-"
+    return f"{empresa} • {email} • {resposta_id[-12:]}"
+
+selected = (
+    st.selectbox(
+        "Selecionar resposta",
+        ids,
+        format_func=format_option,
+        key="resp_selected"
+    )
+    if ids else None
+)
 if not ids:
     st.info("Sem respostas para selecionar com os filtros atuais.")
     st.stop()

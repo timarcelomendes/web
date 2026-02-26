@@ -14,6 +14,12 @@ def detect_odbc_driver():
         pass
     return "ODBC ?"
 
+
+def exec_sql(sql: str, params: dict | None = None):
+    engine = get_engine()
+    with engine.begin() as conn:
+        conn.execute(text(sql), params or {})
+
 @st.cache_resource
 def _engine(conn_key: str, odbc_connect: str):
     params = urllib.parse.quote_plus(odbc_connect)
