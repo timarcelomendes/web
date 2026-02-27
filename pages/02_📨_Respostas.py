@@ -53,10 +53,11 @@ def load_respostas(empresa, categoria, q, dt_ini, dt_fim, incluir_excluidas, top
 
     sql = f"""
     SELECT TOP ({int(topn)})
-    resposta_id, cliente_id, email, empresa, data_resposta, nota,
-    categoria, motivo, canal,
-    jira_issue_key, jira_issue_url,
-    deleted_at, created_at
+        resposta_id, cliente_id, email, empresa, data_resposta, nota,
+        categoria, motivo, canal,
+        expectativas, o_que_faltava, -- 👈 Novos campos adicionados
+        jira_issue_key, jira_issue_url,
+        deleted_at, created_at
     FROM dbo.nps_respostas
     {where_sql}
     ORDER BY data_resposta DESC, created_at DESC;
@@ -66,8 +67,13 @@ def load_respostas(empresa, categoria, q, dt_ini, dt_fim, incluir_excluidas, top
 
     def cat_badge(c):
         return "🟩 Promotor" if c == "Promotor" else ("🟨 Neutro" if c == "Neutro" else ("🟥 Detrator" if c == "Detrator" else "⬜"))
-    df["categoria_badge"] = df["categoria"].apply(cat_badge) if "categoria" in df.columns else ""
-    df["status"] = df["deleted_at"].apply(lambda x: "🟢 Ativa" if pd.isna(x) else "⚫ Excluído")
+    
+    if "categoria" in df.columns:
+        df["categoria_badge"] = df["categoria"].apply(cat_badge)
+    
+    if "deleted_at" in df.columns:
+        df["status"] = df["deleted_at"].apply(lambda x: "🟢 Ativa" if pd.isna(x) else "⚫ Excluído")
+        
     return df
 
 def load_one(resposta_id):
@@ -75,7 +81,8 @@ def load_one(resposta_id):
     SELECT TOP 1
       resposta_id, cliente_id, email, empresa, perfil_decisor, segmento,
       data_resposta, nota, categoria, motivo, canal,
-      tally_form_id, tally_submission_id,
+      expectativas, o_que_faltava, -- 👈 Novos campos adicionados
+      form_id, submission_id,
       deleted_at, created_at
     FROM dbo.nps_respostas
     WHERE resposta_id = :resposta_id;
@@ -85,10 +92,16 @@ def load_one(resposta_id):
         return None
     return df.iloc[0].to_dict()
 
-def update_resposta(resposta_id, nota, categoria, motivo, canal):
+def update_resposta(resposta_id, nota, categoria, motivo, canal, expectativas, o_que_faltava):
     sql = """
     UPDATE dbo.nps_respostas
-    SET nota=:nota, categoria=:categoria, motivo=:motivo, canal=:canal
+    SET 
+        nota=:nota, 
+        categoria=:categoria, 
+        motivo=:motivo, 
+        canal=:canal,
+        expectativas=:expectativas,     -- 👈 Update mapeado
+        o_que_faltava=:o_que_faltava    -- 👈 Update mapeado
     WHERE resposta_id=:resposta_id;
     """
     exec_sql(sql, {
@@ -97,6 +110,8 @@ def update_resposta(resposta_id, nota, categoria, motivo, canal):
         "categoria": categoria,
         "motivo": (motivo or "").strip() or None,
         "canal": (canal or "").strip() or None,
+        "expectativas": (expectativas or "").strip() or None,
+        "o_que_faltava": (o_que_faltava or "").strip() or None,
     })
 
 def soft_delete(resposta_id):
@@ -105,6 +120,8 @@ def soft_delete(resposta_id):
 def restore(resposta_id):
     exec_sql("UPDATE dbo.nps_respostas SET deleted_at = NULL WHERE resposta_id=:resposta_id;", {"resposta_id": resposta_id})
 
+
+# --- INÍCIO DA UI STREAMLIT ---
 st.set_page_config(page_title="Respostas", layout="wide")
 st.title("📩 Respostas")
 
@@ -123,8 +140,6 @@ with st.sidebar:
     incluir_excluidas = st.checkbox("Incluir excluídas", value=False, key="resp_inc_exc")
     topn = st.slider("Limite", 50, 2000, 300, step=50, key="resp_topn")
 
-cat_param = "" if categoria == "Todos" else categoria
-df = load_respostas(empresa, cat_param, q, dt_ini, dt_fim, incluir_excluidas, int(topn))
 cat_param = "" if categoria == "Todos" else categoria
 df = load_respostas(empresa, cat_param, q, dt_ini, dt_fim, incluir_excluidas, int(topn))
 
@@ -152,6 +167,8 @@ cols = [
     "email",
     "nota",
     "categoria_badge",
+    "expectativas",    
+    "o_que_faltava",   # 👈 Faltava adicionar esta linha!
     "motivo_resumo",
     "jira_issue_url",
     "status",
@@ -179,7 +196,10 @@ def format_option(resposta_id):
     row = df[df["resposta_id"] == resposta_id].iloc[0]
     email = row.get("email") or "-"
     empresa = row.get("empresa") or "-"
-    return f"{empresa} • {email} • {resposta_id[-12:]}"
+    data = row.get("data_resposta") or "Sem data"
+    
+    # Agora o dropdown vai mostrar a Data e os últimos 8 caracteres do ID para não ter erro!
+    return f"{data} | {empresa} • {email} [{resposta_id[-8:]}]"
 
 selected = (
     st.selectbox(
@@ -190,6 +210,7 @@ selected = (
     )
     if ids else None
 )
+
 if not ids:
     st.info("Sem respostas para selecionar com os filtros atuais.")
     st.stop()
@@ -210,18 +231,26 @@ with tab_view:
     st.json(item)
 
 with tab_edit:
+    # 👈 Primeiros campos originais
     c1, c2, c3 = st.columns(3)
     nota_val = int(item["nota"]) if item.get("nota") is not None else 0
     nota = c1.number_input("nota", 0, 10, value=nota_val, key="resp_edit_nota")
     idx = CATS.index(item["categoria"]) if item.get("categoria") in CATS else 0
     categoria_new = c2.selectbox("categoria", CATS, index=idx, key="resp_edit_cat")
     canal = c3.text_input("canal", value=item.get("canal") or "", key="resp_edit_canal")
+    
+    # 👈 Novos campos adicionados à aba Editar
+    c4, c5 = st.columns(2)
+    expectativas = c4.text_input("Atendeu às expectativas?", value=item.get("expectativas") or "", key="resp_edit_exp")
+    o_que_faltava = c5.text_input("O que estava faltando?", value=item.get("o_que_faltava") or "", key="resp_edit_falta")
 
+    # Campo de motivo mantido no final por ser texto longo
     motivo = st.text_area("motivo", value=item.get("motivo") or "", height=120, key="resp_edit_motivo")
 
     if st.button("Salvar alterações", type="primary", key="resp_edit_save"):
         try:
-            update_resposta(selected, nota, categoria_new, motivo, canal)
+            # 👈 Passando os novos campos para a função update
+            update_resposta(selected, nota, categoria_new, motivo, canal, expectativas, o_que_faltava)
             st.success("Atualizado ✅")
             st.toast("Resposta atualizada.", icon="✅")
             st.rerun()

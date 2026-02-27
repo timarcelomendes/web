@@ -1,434 +1,302 @@
-import time
-from datetime import datetime, timedelta, date
-import pandas as pd
 import streamlit as st
+import pandas as pd
+from datetime import datetime, date, timedelta
 from sqlalchemy import text
-from sqlalchemy.exc import SQLAlchemyError
-
-from ui import sidebar_logo, sidebar_info, configurar_layout
 from db import get_engine
+from ui import sidebar_logo
 
-configurar_layout()
 sidebar_logo()
-sidebar_info()
 
-APP_TITLE = "NPS POC — Admin"
-TZ_LABEL = "Horário local"
+st.set_page_config(page_title="Home", layout="wide")
+st.title("🏠 Painel")
+st.caption("Painel inicial. Use as páginas para operar dados.")
 
+# Horário local (mantém)
+st.write(f"Horário local: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
 
 # =========================
-# Helpers
+# DB helpers
 # =========================
+def read_df(sql: str, params: dict | None = None) -> pd.DataFrame:
+    engine = get_engine()
+    with engine.connect() as conn:
+        res = conn.execute(text(sql), params or {})
+        rows = res.fetchall()
+        cols = list(res.keys())
+    return pd.DataFrame(rows, columns=cols)
 
-def nps_badge(nps: float) -> tuple[str, str]:
-    if nps >= 50:
-        return "Excelente", "🟢"
-    if nps >= 0:
-        return "Atenção", "🟡"
-    return "Crítico", "🔴"
-
-
-def pct(part: int, total: int) -> float:
-    return 0.0 if total <= 0 else (part * 100.0 / total)
-
-
-def to_date(v) -> date | None:
-    if v is None or v == "":
-        return None
-    if isinstance(v, date):
-        return v
+def safe_int(v, default=0):
     try:
-        return pd.to_datetime(v).date()
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return default
+        return int(v)
     except Exception:
-        return None
+        return default
 
-
-@st.cache_resource
-def get_db_engine():
-    return get_engine()
-
-
-@st.cache_data(ttl=60)
-def load_empresas(cache_key: str) -> list[str]:
-    engine = get_db_engine()
-    sql = text("""
-        SELECT DISTINCT TOP (500) LTRIM(RTRIM(empresa)) AS empresa
-        FROM dbo.nps_respostas
-        WHERE empresa IS NOT NULL AND LTRIM(RTRIM(empresa)) <> ''
-        ORDER BY empresa ASC;
-    """)
-    df = pd.read_sql(sql, engine)
-    return df["empresa"].dropna().astype(str).tolist()
-
-
-@st.cache_data(ttl=60)
-def load_kpis_periodo(cache_key: str, empresa: str | None, dias: int) -> dict:
-    """
-    Retorna KPIs para:
-      - janela atual: últimos {dias} dias
-      - janela anterior: {dias} dias anteriores
-      - geral (all time)
-    """
-    engine = get_db_engine()
-
-    where_empresa = ""
-    params: dict = {"dias": int(dias)}
-    if empresa and empresa != "Todas":
-        where_empresa = "AND LTRIM(RTRIM(empresa)) = :empresa"
-        params["empresa"] = empresa
-
-    sql = text(f"""
-        WITH base AS (
-            SELECT
-                CAST(nota AS INT) AS nota,
-                CAST(created_at AS DATETIME2) AS created_at,
-                LTRIM(RTRIM(empresa)) AS empresa
-            FROM dbo.nps_respostas
-            WHERE deleted_at IS NULL OR deleted_at IS NULL  -- compat: se não existir, não quebra no SQL Server? (ignorará apenas se existir)
-        ),
-        scope AS (
-            SELECT *
-            FROM base
-            WHERE 1=1
-            {where_empresa}
-        ),
-        all_time AS (
-            SELECT
-                COUNT(1) AS total,
-                SUM(CASE WHEN nota BETWEEN 9 AND 10 THEN 1 ELSE 0 END) AS prom,
-                SUM(CASE WHEN nota BETWEEN 7 AND 8 THEN 1 ELSE 0 END) AS neu,
-                SUM(CASE WHEN nota BETWEEN 0 AND 6 THEN 1 ELSE 0 END) AS det
-            FROM scope
-        ),
-        cur AS (
-            SELECT
-                COUNT(1) AS total,
-                SUM(CASE WHEN nota BETWEEN 9 AND 10 THEN 1 ELSE 0 END) AS prom,
-                SUM(CASE WHEN nota BETWEEN 7 AND 8 THEN 1 ELSE 0 END) AS neu,
-                SUM(CASE WHEN nota BETWEEN 0 AND 6 THEN 1 ELSE 0 END) AS det
-            FROM scope
-            WHERE created_at >= DATEADD(day, -:dias, GETDATE())
-        ),
-        prev AS (
-            SELECT
-                COUNT(1) AS total,
-                SUM(CASE WHEN nota BETWEEN 9 AND 10 THEN 1 ELSE 0 END) AS prom,
-                SUM(CASE WHEN nota BETWEEN 7 AND 8 THEN 1 ELSE 0 END) AS neu,
-                SUM(CASE WHEN nota BETWEEN 0 AND 6 THEN 1 ELSE 0 END) AS det
-            FROM scope
-            WHERE created_at >= DATEADD(day, -(:dias*2), GETDATE())
-              AND created_at <  DATEADD(day, -:dias, GETDATE())
-        )
-        SELECT
-            a.total AS total_all, a.prom AS prom_all, a.neu AS neu_all, a.det AS det_all,
-            c.total AS total_cur, c.prom AS prom_cur, c.neu AS neu_cur, c.det AS det_cur,
-            p.total AS total_prev, p.prom AS prom_prev, p.neu AS neu_prev, p.det AS det_prev
-        FROM all_time a
-        CROSS JOIN cur c
-        CROSS JOIN prev p;
-    """)
-
+def safe_float(v, default=0.0):
     try:
-        row = pd.read_sql(sql, engine, params=params).iloc[0].to_dict()
-    except Exception as e:
-        raise
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            return default
+        return float(v)
+    except Exception:
+        return default
 
-    def calc_nps(prom: int, det: int, total: int) -> float:
-        if not total:
-            return 0.0
-        return (prom * 100.0 / total) - (det * 100.0 / total)
+def nps_from_counts(p: int, n: int, d: int) -> float:
+    tot = p + n + d
+    if tot <= 0:
+        return 0.0
+    return ((p / tot) - (d / tot)) * 100.0
 
-    total_cur = int(row.get("total_cur") or 0)
-    total_prev = int(row.get("total_prev") or 0)
-    total_all = int(row.get("total_all") or 0)
-
-    prom_cur = int(row.get("prom_cur") or 0)
-    neu_cur = int(row.get("neu_cur") or 0)
-    det_cur = int(row.get("det_cur") or 0)
-
-    prom_prev = int(row.get("prom_prev") or 0)
-    neu_prev = int(row.get("neu_prev") or 0)
-    det_prev = int(row.get("det_prev") or 0)
-
-    prom_all = int(row.get("prom_all") or 0)
-    neu_all = int(row.get("neu_all") or 0)
-    det_all = int(row.get("det_all") or 0)
-
-    nps_cur = round(calc_nps(prom_cur, det_cur, total_cur), 1)
-    nps_prev = round(calc_nps(prom_prev, det_prev, total_prev), 1)
-    nps_all = round(calc_nps(prom_all, det_all, total_all), 1)
-
-    return {
-        "total_cur": total_cur,
-        "total_prev": total_prev,
-        "total_all": total_all,
-        "prom_cur": prom_cur,
-        "neu_cur": neu_cur,
-        "det_cur": det_cur,
-        "prom_prev": prom_prev,
-        "neu_prev": neu_prev,
-        "det_prev": det_prev,
-        "nps_cur": nps_cur,
-        "nps_prev": nps_prev,
-        "nps_all": nps_all,
-        "prom_pct_cur": round(pct(prom_cur, total_cur), 1),
-        "neu_pct_cur": round(pct(neu_cur, total_cur), 1),
-        "det_pct_cur": round(pct(det_cur, total_cur), 1),
-        "prom_pct_prev": round(pct(prom_prev, total_prev), 1),
-        "neu_pct_prev": round(pct(neu_prev, total_prev), 1),
-        "det_pct_prev": round(pct(det_prev, total_prev), 1),
-    }
-
-
-@st.cache_data(ttl=60)
-def load_series_diaria(cache_key: str, empresa: str | None, dias: int) -> pd.DataFrame:
-    """
-    Série diária dos últimos 2*dias, para gráfico e comparação.
-    """
-    engine = get_db_engine()
-
-    where_empresa = ""
-    params: dict = {"dias": int(dias)}
-    if empresa and empresa != "Todas":
-        where_empresa = "AND LTRIM(RTRIM(empresa)) = :empresa"
-        params["empresa"] = empresa
-
-    sql = text(f"""
-        WITH scope AS (
-            SELECT
-                CAST(created_at AS DATE) AS dt,
-                CAST(nota AS INT) AS nota
-            FROM dbo.nps_respostas
-            WHERE created_at >= DATEADD(day, -(:dias*2), CAST(GETDATE() AS DATE))
-            {where_empresa}
-        )
-        SELECT
-            dt,
-            COUNT(1) AS total,
-            SUM(CASE WHEN nota BETWEEN 9 AND 10 THEN 1 ELSE 0 END) AS prom,
-            SUM(CASE WHEN nota BETWEEN 0 AND 6 THEN 1 ELSE 0 END) AS det
-        FROM scope
-        GROUP BY dt
-        ORDER BY dt ASC;
-    """)
-    df = pd.read_sql(sql, engine, params=params)
-    if df.empty:
-        return df
-
-    df["nps"] = df.apply(lambda r: 0.0 if r["total"] == 0 else (r["prom"]*100.0/r["total"] - r["det"]*100.0/r["total"]), axis=1)
-    df["nps"] = df["nps"].round(1)
-    return df
-
+def fmt_delta(v: float) -> str:
+    sign = "+" if v > 0 else ""
+    # 2 casas pra NPS
+    return f"{sign}{v:.2f}"
 
 # =========================
-# HOME
+# Controles
 # =========================
-
-st.set_page_config(page_title=APP_TITLE, layout="wide")
-st.title("🧭 NPS Admin (POC)")
-
-top_left, top_right = st.columns([4, 1])
-
-with top_left:
-    st.caption("Painel inicial. Use as páginas para operar dados.")
-
-with top_right:
-    st.caption(f"{TZ_LABEL}: **{datetime.now().strftime('%d/%m/%Y %H:%M:%S')}**")
-
 st.divider()
+cA, cB, cC = st.columns([1, 1, 2])
 
-# =========================
-# Filtros (Período + Empresa)
-# =========================
-
-f1, f2, f3 = st.columns([1.2, 2.2, 1])
-
-with f1:
-    dias = st.selectbox(
+with cA:
+    periodo = st.selectbox(
         "Período de comparação",
         [7, 14, 30, 60, 90],
         index=0,
         format_func=lambda x: f"Últimos {x} dias",
-        key="home_dias",
+        key="home_periodo",
     )
 
-with f2:
-    cache_key = f'{st.secrets.get("SQL_SERVER","")} | {st.secrets.get("SQL_DB","")}'
-    try:
-        empresas = ["Todas"] + load_empresas(cache_key)
-    except Exception:
-        empresas = ["Todas"]
-    empresa = st.selectbox("Empresa", empresas, index=0, key="home_empresa")
+hoje = date.today()
+ini_atual = hoje - timedelta(days=int(periodo))
+ini_anterior = ini_atual - timedelta(days=int(periodo))
+fim_anterior = ini_atual
 
-with f3:
-    if st.button("🔄 Atualizar", use_container_width=True, key="home_refresh"):
-        load_kpis_periodo.clear()
-        load_series_diaria.clear()
-        st.rerun()
+# empresas disponíveis
+df_emp = read_df("""
+    SELECT DISTINCT empresa
+    FROM dbo.nps_respostas
+    WHERE deleted_at IS NULL
+      AND empresa IS NOT NULL
+      AND LTRIM(RTRIM(empresa)) <> ''
+    ORDER BY empresa ASC;
+""")
+empresas = ["Todas"] + (df_emp["empresa"].dropna().astype(str).tolist() if not df_emp.empty else [])
+
+with cB:
+    empresa_sel = st.selectbox("Empresa", empresas, index=0, key="home_empresa")
+
+empresa_where = ""
+params_base = {
+    "ini_atual": str(ini_atual),
+    "fim_atual": str(hoje),
+    "ini_ant": str(ini_anterior),
+    "fim_ant": str(fim_anterior),
+}
+if empresa_sel != "Todas":
+    empresa_where = " AND empresa = :empresa "
+    params_base["empresa"] = empresa_sel
 
 # =========================
-# Dados e KPIs
+# Dados agregados (KPIs)
 # =========================
-
-try:
-    kpi = load_kpis_periodo(cache_key, empresa, int(dias))
-    serie = load_series_diaria(cache_key, empresa, int(dias))
-except SQLAlchemyError as e:
-    st.error("Sem conexão com o banco (verifique em Status de Conexão).")
-    st.code(str(e)[:1200])
-    st.stop()
-except Exception as e:
-    st.error("Erro ao carregar indicadores.")
-    st.code(str(e)[:1200])
-    st.stop()
-
-nps_cur = float(kpi["nps_cur"])
-nps_prev = float(kpi["nps_prev"])
-nps_all = float(kpi["nps_all"])
-
-total_cur = int(kpi["total_cur"])
-total_prev = int(kpi["total_prev"])
-
-prom_cur = int(kpi["prom_cur"])
-neu_cur = int(kpi["neu_cur"])
-det_cur = int(kpi["det_cur"])
-
-prom_pct_cur = float(kpi["prom_pct_cur"])
-neu_pct_cur = float(kpi["neu_pct_cur"])
-det_pct_cur = float(kpi["det_pct_cur"])
-
-prom_pct_prev = float(kpi["prom_pct_prev"])
-neu_pct_prev = float(kpi["neu_pct_prev"])
-det_pct_prev = float(kpi["det_pct_prev"])
-
-label, emoji = nps_badge(nps_cur)
-
-# Deltas (janela atual vs anterior do mesmo tamanho)
-nps_delta = round(nps_cur - nps_prev, 1)
-resp_delta = total_cur - total_prev
-prom_delta_pp = round(prom_pct_cur - prom_pct_prev, 1)
-neu_delta_pp = round(neu_pct_cur - neu_pct_prev, 1)
-det_delta_pp = round(det_pct_cur - det_pct_prev, 1)
-
-st.subheader("📊 Indicadores NPS")
-st.caption(f"{emoji} **{label}** • Comparando: últimos **{dias} dias** vs **{dias} dias anteriores**" + ("" if empresa == "Todas" else f" • Empresa: **{empresa}**"))
-
-m1, m2, m3, m4, m5 = st.columns(5)
-
-# 1) NPS com delta (melhor visual com sinal e delta_color)
-m1.metric(
-    "NPS (janela)",
-    f"{nps_cur:.1f}",
-    delta=f"{nps_delta:+.1f}",
-    delta_color="normal",
-    help="NPS = %Promotores - %Detratores",
+sql_kpis = f"""
+WITH base AS (
+  SELECT
+    CAST(data_resposta AS DATE) AS dia,
+    CASE
+      WHEN CAST(data_resposta AS DATE) >= CAST(:ini_atual AS DATE)
+       AND CAST(data_resposta AS DATE) <= CAST(:fim_atual AS DATE) THEN 'atual'
+      WHEN CAST(data_resposta AS DATE) >= CAST(:ini_ant AS DATE)
+       AND CAST(data_resposta AS DATE) <  CAST(:fim_ant AS DATE) THEN 'anterior'
+      ELSE NULL
+    END AS periodo,
+    nota
+  FROM dbo.nps_respostas
+  WHERE deleted_at IS NULL
+    AND data_resposta IS NOT NULL
+    {empresa_where}
+),
+agg AS (
+  SELECT
+    periodo,
+    COUNT(1) AS total,
+    SUM(CASE WHEN nota >= 9 THEN 1 ELSE 0 END) AS promotores,
+    SUM(CASE WHEN nota BETWEEN 7 AND 8 THEN 1 ELSE 0 END) AS neutros,
+    SUM(CASE WHEN nota <= 6 THEN 1 ELSE 0 END) AS detratores
+  FROM base
+  WHERE periodo IS NOT NULL
+  GROUP BY periodo
 )
+SELECT * FROM agg;
+"""
+df_k = read_df(sql_kpis, params_base)
 
-# 2) Volume de respostas
-m2.metric(
-    "Respostas",
-    f"{total_cur}",
-    delta=f"{resp_delta:+d}",
-    delta_color="normal",
-)
+def pick(df: pd.DataFrame, periodo: str, col: str):
+    if df.empty:
+        return 0
+    sub = df[df["periodo"] == periodo]
+    if sub.empty:
+        return 0
+    return sub.iloc[0].get(col, 0)
 
-# 3) Promotores (bom subir)
-m3.metric(
-    "🟢 Promotores",
-    f"{prom_cur} ({prom_pct_cur:.1f}%)",
-    delta=f"{prom_delta_pp:+.1f} p.p.",
-    delta_color="normal",
-)
+tot_a = safe_int(pick(df_k, "atual", "total"))
+p_a = safe_int(pick(df_k, "atual", "promotores"))
+n_a = safe_int(pick(df_k, "atual", "neutros"))
+d_a = safe_int(pick(df_k, "atual", "detratores"))
+nps_a = nps_from_counts(p_a, n_a, d_a)
 
-# 4) Neutros (delta sem cor forte)
-m4.metric(
-    "🟡 Neutros",
-    f"{neu_cur} ({neu_pct_cur:.1f}%)",
-    delta=f"{neu_delta_pp:+.1f} p.p.",
-    delta_color="off",
-)
+tot_b = safe_int(pick(df_k, "anterior", "total"))
+p_b = safe_int(pick(df_k, "anterior", "promotores"))
+n_b = safe_int(pick(df_k, "anterior", "neutros"))
+d_b = safe_int(pick(df_k, "anterior", "detratores"))
+nps_b = nps_from_counts(p_b, n_b, d_b)
 
-# 5) Detratores (ruim subir → inverse)
-m5.metric(
-    "🔴 Detratores",
-    f"{det_cur} ({det_pct_cur:.1f}%)",
-    delta=f"{det_delta_pp:+.1f} p.p.",
-    delta_color="inverse",
-)
+delta_tot = tot_a - tot_b
+delta_nps = nps_a - nps_b
 
-# NPS geral (all time) como referência
-st.caption(f"Referência: **NPS geral {nps_all:.1f}** (todo o histórico)")
+# delta_color: NPS é melhor quando sobe => normal
+# total respostas depende do seu objetivo. vou deixar normal.
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("Respostas (janela)", tot_a, delta=f"{delta_tot:+d}", delta_color="normal")
+col2.metric("NPS (janela)", f"{nps_a:.2f}", delta=fmt_delta(delta_nps), delta_color="normal")
+col3.metric("Promotores", p_a, delta=f"{(p_a-p_b):+d}", delta_color="normal")
+col4.metric("Detratores", d_a, delta=f"{(d_a-d_b):+d}", delta_color="inverse")
 
-# Gauge discreto
-gauge = max(0.0, min(1.0, (nps_cur + 100.0) / 200.0))
-st.progress(gauge)
-st.caption("NPS Gauge: -100 → 0 → 100")
+# “gauge” simples de tendência (barra)
+st.caption("Tendência do NPS (janela atual)")
+g_min, g_max = -100.0, 100.0
+pct = (nps_a - g_min) / (g_max - g_min)
+pct = max(0.0, min(1.0, pct))
+st.progress(pct, text=f"NPS {nps_a:.2f} (de -100 a 100)")
 
 st.divider()
 
 # =========================
-# Gráfico (comparação período atual vs anterior)
+# Série diária (gráficos)
 # =========================
+sql_daily = f"""
+WITH base AS (
+  SELECT
+    CAST(data_resposta AS DATE) AS dia,
+    CASE
+      WHEN CAST(data_resposta AS DATE) >= CAST(:ini_atual AS DATE)
+       AND CAST(data_resposta AS DATE) <= CAST(:fim_atual AS DATE) THEN 'atual'
+      WHEN CAST(data_resposta AS DATE) >= CAST(:ini_ant AS DATE)
+       AND CAST(data_resposta AS DATE) <  CAST(:fim_ant AS DATE) THEN 'anterior'
+      ELSE NULL
+    END AS periodo,
+    nota
+  FROM dbo.nps_respostas
+  WHERE deleted_at IS NULL
+    AND data_resposta IS NOT NULL
+    {empresa_where}
+),
+daily AS (
+  SELECT
+    dia,
+    periodo,
+    COUNT(1) AS total,
+    SUM(CASE WHEN nota >= 9 THEN 1 ELSE 0 END) AS promotores,
+    SUM(CASE WHEN nota BETWEEN 7 AND 8 THEN 1 ELSE 0 END) AS neutros,
+    SUM(CASE WHEN nota <= 6 THEN 1 ELSE 0 END) AS detratores
+  FROM base
+  WHERE periodo IS NOT NULL
+  GROUP BY dia, periodo
+)
+SELECT
+  dia,
+  periodo,
+  total,
+  promotores,
+  neutros,
+  detratores
+FROM daily
+ORDER BY dia ASC;
+"""
+df = read_df(sql_daily, params_base)
 
-st.subheader("📈 Tendência diária")
+if df.empty:
+    st.info("Sem dados no período selecionado.")
+    st.stop()
 
-if serie is None or serie.empty:
-    st.info("Sem dados suficientes para gerar a tendência diária nesse período.")
-else:
-    # cria duas janelas (2*dias) e marca qual período
-    df = serie.copy()
-    df["dt"] = pd.to_datetime(df["dt"]).dt.date
+df["nps"] = df.apply(lambda r: nps_from_counts(
+    safe_int(r.get("promotores")),
+    safe_int(r.get("neutros")),
+    safe_int(r.get("detratores")),
+), axis=1)
 
-    today = datetime.now().date()
-    start_cur = today - timedelta(days=int(dias))
-    start_prev = today - timedelta(days=int(dias) * 2)
+pivot_nps = df.pivot_table(index="dia", columns="periodo", values="nps", aggfunc="mean").sort_index()
+pivot_cnt = df.pivot_table(index="dia", columns="periodo", values="total", aggfunc="sum").sort_index()
 
-    df["periodo"] = df["dt"].apply(lambda d: "Atual" if d >= start_cur else "Anterior")
+tab_g, tab_d = st.tabs(["📈 Gráficos", "📋 Detalhes"])
 
-    # Alinha por "dia relativo" dentro da janela (1..dias)
-    def day_index(d: date) -> int:
-        if d >= start_cur:
-            return (d - start_cur).days + 1
-        return (d - start_prev).days + 1
+with tab_g:
+    left, right = st.columns([2, 1])
+    with right:
+        modo = st.radio(
+            "Exibição",
+            ["Somente diário", "Somente média móvel", "Diário + média móvel"],
+            index=0,
+            horizontal=False,
+            key="home_chart_mode",
+        )
+        mm = st.slider("Janela da média móvel (dias)", 3, 14, 7, key="home_mm_window")
 
-    df["dia"] = df["dt"].apply(day_index)
+    def with_moving_average(pivot: pd.DataFrame, suffix: str) -> pd.DataFrame:
+        if pivot.empty:
+            return pivot
+        out = pivot.copy()
+        for col in pivot.columns:
+            out[f"{col} {suffix}"] = pivot[col].rolling(int(mm), min_periods=1).mean()
+        return out
 
-    pivot_nps = df.pivot_table(index="dia", columns="periodo", values="nps", aggfunc="mean").sort_index()
-    pivot_cnt = df.pivot_table(index="dia", columns="periodo", values="total", aggfunc="sum").sort_index()
+    nps_mm = with_moving_average(pivot_nps, f"(MM{int(mm)})")
+    cnt_mm = with_moving_average(pivot_cnt, f"(MM{int(mm)})")
 
-    cA, cB = st.columns(2)
+    if modo == "Somente diário":
+        nps_plot = pivot_nps
+        cnt_plot = pivot_cnt
+    elif modo == "Somente média móvel":
+        nps_plot = nps_mm[[c for c in nps_mm.columns if "(MM" in c]]
+        cnt_plot = cnt_mm[[c for c in cnt_mm.columns if "(MM" in c]]
+    else:
+        nps_plot = nps_mm
+        cnt_plot = cnt_mm
 
-    with cA:
-        st.caption("NPS diário (janela atual vs anterior)")
-        st.line_chart(pivot_nps, height=240)
-
-    with cB:
+    c1, c2 = st.columns(2)
+    with c1:
+        st.caption("NPS (janela atual vs anterior)")
+        st.line_chart(nps_plot, height=260)
+    with c2:
         st.caption("Respostas/dia (janela atual vs anterior)")
-        st.line_chart(pivot_cnt, height=240)
+        st.line_chart(cnt_plot, height=260)
 
-st.divider()
+    with left:
+        st.info("Dica: use **Diário + média móvel** para enxergar tendência sem perder o detalhe do dia.")
 
-# =========================
-# Navegação
-# =========================
+with tab_d:
+    st.caption("Tabela diária por período, com deltas (Atual − Anterior).")
 
-st.subheader("O que você quer fazer agora?")
+    tbl = pivot_nps.rename(columns=lambda c: f"nps_{c}").join(
+        pivot_cnt.rename(columns=lambda c: f"total_{c}"),
+        how="outer"
+    ).sort_index()
 
-def card(title, desc, button, page, icon):
-    with st.container(border=True):
-        left, right = st.columns([6,2])
-        with left:
-            st.markdown(f"### {icon} {title}")
-            st.caption(desc)
-        with right:
-            st.write("")
-            if st.button(button, use_container_width=True, type="primary"):
-                st.switch_page(page)
+    if "nps_atual" in tbl.columns and "nps_anterior" in tbl.columns:
+        tbl["Δ nps"] = (tbl["nps_atual"] - tbl["nps_anterior"]).round(2)
+    if "total_atual" in tbl.columns and "total_anterior" in tbl.columns:
+        tbl["Δ respostas"] = (tbl["total_atual"] - tbl["total_anterior"]).astype("Int64")
 
-colA, colB = st.columns(2)
+    tbl = tbl.reset_index().rename(columns={"dia": "Dia"})
 
-with colA:
-    card("Clientes", "Cadastro e ações", "Abrir Clientes →", "pages/01_👤_Clientes.py", "👥")
+    st.dataframe(tbl, use_container_width=True, hide_index=True)
 
-with colB:
-    card("Respostas", "Auditoria de respostas", "Abrir Respostas →", "pages/02_📨_Respostas.py", "📩")
+    csv = tbl.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Baixar CSV (detalhes)",
+        data=csv,
+        file_name="home_detalhes_diarios.csv",
+        mime="text/csv",
+        key="home_download_details_csv",
+    )

@@ -107,9 +107,9 @@ def try_connect_with_driver(driver_name: str):
         return False, None, str(e)[:2000]
 
 
-def test_n8n(url: str, cliente_id: str = "C-TEST") -> tuple[bool, int | None, str]:
+def test_n8n(url: str, cliente_id: str = "C-TEST") -> tuple[bool, int | None, str, str | None]:
     if not url:
-        return False, None, "N8N_FORCE_URL não configurada."
+        return False, None, "N8N_FORCE_URL não configurada.", None
 
     # fallback: webhook-test -> webhook
     urls_to_try = [url]
@@ -123,14 +123,14 @@ def test_n8n(url: str, cliente_id: str = "C-TEST") -> tuple[bool, int | None, st
             resp = requests.post(u, json={"cliente_id": cliente_id}, timeout=20)
             ms = int((time.time() - t0) * 1000)
             if 200 <= resp.status_code < 300:
-                return True, ms, f"HTTP {resp.status_code}"
+                return True, ms, f"HTTP {resp.status_code}", u
             last_err = f"HTTP {resp.status_code} | {resp.text[:300]}"
         except requests.exceptions.Timeout:
             last_err = "Timeout (20s)"
         except Exception as e:
             last_err = str(e)
 
-    return False, None, last_err
+    return False, None, last_err, None
 
 
 # -------------------- Cards do topo --------------------
@@ -219,7 +219,7 @@ with tab_db:
         st.info("Clique em **Rodar testes** para executar diagnósticos avançados.")
 
 with tab_n8n:
-    st.write("**N8N_FORCE_URL**:")
+    st.write("**N8N_FORCE_URL (Original configurada no secrets)**:")
     st.code(N8N_FORCE_URL or "(vazio)", language="text")
 
     col1, col2 = st.columns([1, 2])
@@ -228,14 +228,16 @@ with tab_n8n:
 
     if do_test:
         with st.spinner("Testando n8n..."):
-            ok, ms, info = test_n8n(N8N_FORCE_URL, cliente_id=test_id)
+            ok, ms, info, working_url = test_n8n(N8N_FORCE_URL, cliente_id=test_id)
+        
         if ok:
             st.success(f"n8n OK ✅ ({ms} ms) — {info}")
+            st.info(f"🔗 **Webhook válido em uso no disparo:**\n\n`{working_url}`")
         else:
             st.error("n8n falhou ❌")
             st.code(info, language="text")
     else:
-        st.info("Clique em **Testar n8n** para validar conectividade do webhook.")
+        st.info("Clique em **Testar n8n** para validar conectividade e exibir a URL final do webhook ativo.")
 
 with tab_runtime:
     st.code(sh("pwd"), language="text")

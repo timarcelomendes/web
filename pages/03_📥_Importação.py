@@ -51,9 +51,6 @@ import io
 import pandas as pd
 import streamlit as st
 
-def _norm_col(c: str) -> str:
-    return (c or "").strip().lower().replace(" ", "_").replace("-", "_")
-
 def _pick_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
     cols = {_norm_col(c): c for c in df.columns}
     for cand in candidates:
@@ -259,7 +256,7 @@ def read_respostas_file(uploaded_file) -> pd.DataFrame:
     if missing:
         raise ValueError(
             f"Planilha sem colunas obrigatórias: {missing}. "
-            "Esperado: email, empresa, nota, data_resposta (opcionais: cliente_id, categoria, motivo, canal, perfil_decisor, segmento, resposta_id, tally_form_id, tally_submission_id)."
+            "Esperado: email, empresa, nota, data_resposta (opcionais: cliente_id, categoria, motivo, canal, perfil_decisor, segmento, resposta_id, form_id, submission_id)."
         )
 
     # defaults
@@ -277,10 +274,10 @@ def read_respostas_file(uploaded_file) -> pd.DataFrame:
         df["segmento"] = ""
     if "resposta_id" not in df.columns:
         df["resposta_id"] = ""
-    if "tally_form_id" not in df.columns:
-        df["tally_form_id"] = ""
-    if "tally_submission_id" not in df.columns:
-        df["tally_submission_id"] = ""
+    if "form_id" not in df.columns:
+        df["form_id"] = ""
+    if "submission_id" not in df.columns:
+        df["submission_id"] = ""
 
     # normaliza string
     for c in df.columns:
@@ -305,9 +302,9 @@ def validate_respostas_df(df: pd.DataFrame) -> dict:
     cat = df["categoria"].astype(str).str.strip()
     invalid_cat = df[(cat != "") & (~cat.isin(CATS))]
 
-    # duplicados na planilha: preferir tally_submission_id se tiver
-    if (df["tally_submission_id"].astype(str).str.strip() != "").any():
-        dup = df.duplicated(subset=["tally_submission_id"], keep=False) & (df["tally_submission_id"].str.strip() != "")
+    # duplicados na planilha: preferir submission_id se tiver
+    if (df["submission_id"].astype(str).str.strip() != "").any():
+        dup = df.duplicated(subset=["submission_id"], keep=False) & (df["submission_id"].str.strip() != "")
     else:
         dup = df.duplicated(subset=["email", "empresa", "data_resposta", "nota"], keep=False)
     dup_df = df[dup].copy()
@@ -322,26 +319,26 @@ def validate_respostas_df(df: pd.DataFrame) -> dict:
 
 def exists_respostas_bulk(df: pd.DataFrame) -> int:
     """
-    Heurística: se tiver tally_submission_id, checa por ele.
+    Heurística: se tiver submission_id, checa por ele.
     Se não tiver, não bloqueia (pois não há chave única confiável).
     Retorna quantidade de submission_ids já existentes.
     """
-    has_tally = (df["tally_submission_id"].astype(str).str.strip() != "").any()
-    if not has_tally:
+    has_sub_id = (df["submission_id"].astype(str).str.strip() != "").any()
+    if not has_sub_id:
         return 0
 
     # busca existentes no banco (top: POC)
     q = """
-    SELECT LOWER(LTRIM(RTRIM(tally_submission_id))) AS sid
+    SELECT LOWER(LTRIM(RTRIM(submission_id))) AS sid
     FROM dbo.nps_respostas
-    WHERE tally_submission_id IS NOT NULL;
+    WHERE submission_id IS NOT NULL;
     """
     db = read_df(q)
     if db.empty:
         return 0
     db_sids = set(db["sid"].astype(str))
 
-    sids = set(df["tally_submission_id"].astype(str).str.strip().str.lower())
+    sids = set(df["submission_id"].astype(str).str.strip().str.lower())
     sids.discard("")
     return len(sids.intersection(db_sids))
 
@@ -377,20 +374,20 @@ def import_respostas_df(df: pd.DataFrame) -> dict:
             if not resposta_id:
                 resposta_id = _make_resposta_id(cliente_id or "", email)
 
-            tally_form_id = (r.get("tally_form_id") or "").strip() or None
-            tally_submission_id = (r.get("tally_submission_id") or "").strip() or None
+            form_id = (r.get("form_id") or "").strip() or None
+            submission_id = (r.get("submission_id") or "").strip() or None
 
-            # INSERT com proteção por tally_submission_id (quando existir)
+            # INSERT com proteção por submission_id (quando existir)
             sql = """
-            IF (:tally_submission_id IS NULL) OR NOT EXISTS (
-              SELECT 1 FROM dbo.nps_respostas WHERE tally_submission_id = :tally_submission_id
+            IF (:submission_id IS NULL) OR NOT EXISTS (
+              SELECT 1 FROM dbo.nps_respostas WHERE submission_id = :submission_id
             )
             BEGIN
               INSERT INTO dbo.nps_respostas
               (
                 resposta_id, cliente_id, email, empresa, perfil_decisor, segmento,
                 data_resposta, nota, categoria, motivo, canal,
-                tally_form_id, tally_submission_id, created_at
+                form_id, submission_id, created_at
               )
               VALUES
               (
@@ -405,8 +402,8 @@ def import_respostas_df(df: pd.DataFrame) -> dict:
                 :categoria,
                 :motivo,
                 :canal,
-                :tally_form_id,
-                :tally_submission_id,
+                :form_id,
+                :submission_id,
                 SYSUTCDATETIME()
               );
             END
@@ -427,8 +424,8 @@ def import_respostas_df(df: pd.DataFrame) -> dict:
                         "categoria": categoria or None,
                         "motivo": motivo or None,
                         "canal": canal or None,
-                        "tally_form_id": tally_form_id,
-                        "tally_submission_id": tally_submission_id,
+                        "form_id": form_id,
+                        "submission_id": submission_id,
                     }
                 )
 
@@ -454,12 +451,12 @@ def import_respostas_df(df: pd.DataFrame) -> dict:
                         {"email": email, "empresa": empresa},
                     )
 
-            # se tinha tally_submission_id e já existia, o IF acima não insere; como POC, contamos como skipped
-            if tally_submission_id:
+            # se tinha submission_id e já existia, o IF acima não insere; como POC, contamos como skipped
+            if submission_id:
                 # checa se existe agora
                 chk = read_df(
-                    "SELECT 1 AS ok FROM dbo.nps_respostas WHERE tally_submission_id = :sid;",
-                    {"sid": tally_submission_id},
+                    "SELECT 1 AS ok FROM dbo.nps_respostas WHERE submission_id = :sid;",
+                    {"sid": submission_id},
                 )
                 # se existe e não foi inserido por nós, ainda assim estará ok; mas não temos rowcount.
                 # então não diferencia. Mantemos métrica conservadora:
@@ -729,7 +726,7 @@ with tab_analise:
         "empresa": ["empresa", "company", "org"],
         "nota": ["rateus", "nps", "score"],
         "data_resposta": ["data", "created_at", "submitted_at", "dt_resposta"],
-        "tally_submission_id": ["submission_id", "tally_submission", "tally_submissionid"],
+        "submission_id": ["submission_id", "submission", "submissionid"],
     }
 
     cli, origin_cli = ensure_cols(df_cli_raw, map_cli)
@@ -804,7 +801,7 @@ with tab_analise:
     # --- detalhe / tabelas ---
     st.markdown("#### ✅ Respostas OK (cliente encontrado)")
     st.dataframe(
-        resp_ok[["resposta_id","cliente_id","nome","email_cli","empresa_cli","nota","data_resposta","tally_submission_id"]]
+        resp_ok[["resposta_id","cliente_id","nome","email_cli","empresa_cli","nota","data_resposta","submission_id"]]
         if len(resp_ok) else pd.DataFrame(),
         use_container_width=True,
         hide_index=True
@@ -812,7 +809,7 @@ with tab_analise:
 
     st.markdown("#### ⚠️ Respostas órfãs (cliente_id não encontrado no arquivo de clientes)")
     st.dataframe(
-        resp_orfas[["resposta_id","cliente_id","email_resp","empresa_resp","nota","data_resposta","tally_submission_id"]]
+        resp_orfas[["resposta_id","cliente_id","email_resp","empresa_resp","nota","data_resposta","submission_id"]]
         if len(resp_orfas) else pd.DataFrame(),
         use_container_width=True,
         hide_index=True
